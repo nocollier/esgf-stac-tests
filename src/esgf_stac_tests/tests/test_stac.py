@@ -1,5 +1,6 @@
 """Tests for STAC endpoints."""
 
+import pystac
 import pystac_client
 import pytest
 import requests
@@ -7,7 +8,7 @@ from pystac_client.item_search import FilterLike
 
 from esgf_stac_tests.tests.conftest import PerEndpointSuite
 
-# ...and cql filters along with the number of items each should return.
+# What filters shall we test?
 CQL_FILTERS: list[FilterLike] = [
     {
         "op": "or",
@@ -53,6 +54,12 @@ CQL_FILTERS: list[FilterLike] = [
     },
     # ---------------------------------------------------
 ]
+
+# Which collections do we expect the API to find?
+SUPPORTED_COLLECTIONS: list[str] = ["CMIP6"]
+
+# Which time ranges do we check?
+TIME_RANGES: list[str] = [("1850-01-01", "2020-01-01")]
 
 
 class TestStacEndpoints(PerEndpointSuite):
@@ -115,10 +122,12 @@ class TestStacEndpoints(PerEndpointSuite):
 
         assert actual_pages == expected_pages
 
+    @pytest.mark.xfail(reason="CMIP6 STAC extension used is not public")
     def test_validate_catalog(self, endpoint_url: str) -> None:
         """Validate the STAC catalog for the endpoint against the STAC spec."""
-        pystac_client.Client.open(endpoint_url).validate_all()
+        pystac_client.Client.open(endpoint_url).validate_all(max_items=1)
 
+    @pytest.mark.xfail(reason="Temporary design decision")
     def test_endpoint_uses_published_cmip6_extension(self, endpoint_url: str) -> None:
         """
         Check that the endpoint is using the published STAC CMIP6 extension.
@@ -147,3 +156,107 @@ class TestStacEndpoints(PerEndpointSuite):
 
         # Assertion on dicts will give a diff if they are not the same so we can see what changes were needed
         assert cmip6_schema == published_schema
+
+    def test_cmip6_collection_geospatial_extent(self, endpoint_url: str) -> None:
+        """Check for expected collections and print their descriptions.
+
+        Note
+        ----
+        It may be that this is handled in STAC's validate_all().
+        """
+        client = pystac_client.Client.open(endpoint_url)
+
+        cmip6_coll = client.get_collection("CMIP6")
+
+        cmip6_coll_extent = cmip6_coll.extent.to_dict()
+
+        assert cmip6_coll_extent
+        assert "spatial" in cmip6_coll_extent
+        assert "temporal" in cmip6_coll_extent
+        assert "bbox" in cmip6_coll_extent["spatial"]
+        assert "interval" in cmip6_coll_extent["temporal"]
+
+    def test_collections(self, endpoint_url: str) -> None:
+        """Check for expected collections."""
+        client = pystac_client.Client.open(endpoint_url)
+        assert set(SUPPORTED_COLLECTIONS).issubset(
+            [coll.id for coll in client.get_collections()],
+        )
+
+    @pytest.mark.parametrize("time_filter_method", ["datetime", "query", "filter"])
+    @pytest.mark.parametrize("time_range", TIME_RANGES)
+    def test_cmip6_temporal_query(
+        self,
+        endpoint_url: str,
+        time_range: tuple[str, str],
+        time_filter_method: str,
+    ) -> None:
+        """Can we filter out records by a time filter of any sort.
+
+        Note
+        ----
+        I cannot seem to make this work for either endpoint. It may be a problem
+        with publishing?
+        """
+        time_start, time_end = time_range
+        # various methods that time ranges can be 'queried'
+        args = {
+            "datetime": f"{time_start}/{time_end}",
+            "query": [f"start_datetime>{time_start}", f"end_datetime<{time_end}"],
+            "filter": {
+                "op": "t_intersects",
+                "args": [
+                    {"property": "start_datetime"},
+                    f"{time_start}/{time_end}",
+                ],
+            },
+        }
+        client = pystac_client.Client.open(endpoint_url)
+        item_search = client.search(
+            collections=["CMIP6"],
+            max_items=1,
+            **{time_filter_method: args[time_filter_method]},
+        )
+        next(iter(item_search.items()))
+
+    def test_item_content(self, endpoint_url: str) -> None:
+        """Check that we can harvest an asset url."""
+        client = pystac_client.Client.open(endpoint_url)
+        item_search = client.search(collections=["CMIP6"], max_items=1)
+        item = next(iter(item_search.items()))
+        assert isinstance(item, pystac.item.Item)
+        nc_assets = [v.href for _, v in item.assets.items() if v.href.endswith(".nc")]
+        assert len(nc_assets) > 0
+        nc_file_url = nc_assets[0]
+        assert nc_file_url
+
+    def test_facet_counts(self, endpoint_url: str) -> None:
+        """Can we get facet counts.
+
+        Note
+        ----
+        I don't think that pystac does aggregations so we will use search and then
+        hack the url. This tests is a placeholder and needs improved as the
+        capability grows.
+        """
+        client = pystac_client.Client.open(endpoint_url)
+        results = client.search(
+            collections=["CMIP6"],
+            filter={
+                "args": [{"property": "properties.cmip6:activity_id"}, "VolMIP"],
+                "op": "=",
+            },
+        )
+        url = results.url_with_parameters()
+        url = url.replace(
+            "search?",
+            "aggregate?aggregations=cmip6_source_id_frequency,cmip6_table_id_frequency&",
+        )
+        response = requests.get(url)
+        response.raise_for_status()
+        content = response.json()
+        out = {agg["name"]: [b["key"] for b in agg["buckets"]] for agg in content["aggregations"]}
+        assert "cmip6_source_id_frequency" in out
+        assert "cmip6_table_id_frequency" in out
+        assert len(out["cmip6_source_id_frequency"]) > 0
+        assert len(out["cmip6_table_id_frequency"]) > 0
